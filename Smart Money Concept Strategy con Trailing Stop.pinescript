@@ -1,0 +1,259 @@
+//@version=5
+strategy("Smart Money Concept Strategy con Trailing Stop", overlay=true, initial_capital=10000, pyramiding=0)
+
+// ==== Parámetros configurables ====
+atrLength         = input.int(14, title="ATR Length", minval=1)
+atrLookback       = input.int(18, title="ATR Lookback Period", minval=1)
+momentumLength    = input.int(5, title="Momentum Length", minval=1)
+riskRewardRatio1  = input.float(1.1, title="Risk/Reward Ratio 1", minval=1)
+stopLossPoints    = input.float(14, title="Stop Loss in Points", minval=1)
+maxContracts      = input.int(3, title="Max Contracts", minval=1)  // Reducido max contratos para menor exposición
+dynamicPosition   = input.bool(true, title="Dynamic Position Sizing")
+riskPct           = input.float(0.8, title="Risk % of Equity per Trade", minval=0.1, maxval=10)  // Riesgo reducido al 0.8%
+minContracts      = input.int(1, title="Min Contracts for Dynamic Position", minval=1)
+
+// ==== Parámetros para gestión dinámica ====
+partialClosePercentage = input.float(66.0, title="% Drawdown para Cierre Parcial", minval=1.0, maxval=99.0) / 100.0
+partialCloseSize       = input.float(50.0, title="% Contratos a Cerrar", minval=1.0, maxval=99.0) / 100.0
+
+// ==== Parámetros adicionales ====
+useTrailingStop    = input.bool(true, title="Activar Trailing Stop")
+trailActivationPct = input.float(50.0, title="% Profit para Activar Trail", minval=10.0, maxval=90.0) / 100.0
+trailDistance      = input.float(8.0, title="Distancia Trail en Puntos", minval=1.0)
+momentumThreshold  = input.float(1.5, title="Umbral mínimo momentum")
+
+// ==== Parámetros visualización ====
+showLevels = input.bool(true, title="Mostrar Niveles SL/TP")
+slColor   = color.red
+tpColor   = color.green
+entryColor= color.blue
+
+// Horario (Madrid)
+tradingHours      = input.session("1230-2150:23456", "Trading Session")
+isTradingHours    = time(timeframe.period, tradingHours, "Europe/Madrid")
+
+// ==== Indicadores ====
+atrValue                  = ta.atr(atrLength)
+avgAtr                    = ta.sma(atrValue, atrLookback)
+momentum                  = ta.mom(close, momentumLength)
+isBullishFVG              = high[2] < low[0] and high[1] > low[1]
+isBearishFVG              = low[2] > high[0] and low[1] < high[1]
+isBullishMarketStructure  = high[1] > high[2] and low[1] > low[2]
+isBearishMarketStructure  = high[1] < high[2] and low[1] < low[2]
+isVolatile                = atrValue > avgAtr
+hasMomentumUp             = momentum > momentumThreshold
+hasMomentumDown           = momentum < -momentumThreshold
+
+// ==== Cálculo de tamaño de posición dinámico con riesgo ajustado ====
+capital_actual    = strategy.equity
+dollars_per_point = 5
+risk_per_trade    = capital_actual * (riskPct / 100)
+dynamic_contracts = math.max(minContracts, math.min(maxContracts, math.round(risk_per_trade / (stopLossPoints * dollars_per_point))))
+position_size     = dynamicPosition ? dynamic_contracts : maxContracts
+qtyTP1            = 1
+
+// ==== Variables gestión dinámica ====
+var bool partialCloseExecuted = false
+var int contractsClosed = 0
+var float partialCloseLevel = na
+var bool reentryExecuted = false
+
+// ==== Variables trailing stop ====
+var float trailStopLevel = na
+var bool trailActive = false
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+
+// ==== Variables visualización ====
+var float currentSLLevel = na
+var float currentTPLevel = na
+var float currentEntryPrice = na
+var string currentDirection = "NONE"
+
+var float takeProfitPoints1 = na
+var float BEPlusPoints = 2.5
+var bool firstLegClosed = false
+var float stopLossBE = na
+
+// Función para calcular nivel de cierre parcial
+calculatePartialCloseLevel(direction, entry, sl) =>
+    if direction == "LONG"
+        risk = entry - sl
+        entry - (risk * partialClosePercentage)
+    else
+        risk = sl - entry
+        entry + (risk * partialClosePercentage)
+
+// Función para verificar re-entrada
+checkReentryCondition(direction, current_price, entry) =>
+    if direction == "LONG"
+        current_price >= entry
+    else
+        current_price <= entry
+
+// ==== Lógica principal ====
+if (isTradingHours and strategy.position_size == 0)
+    firstLegClosed := false
+    stopLossBE := na
+    partialCloseExecuted := false
+    contractsClosed := 0
+    reentryExecuted := false
+    partialCloseLevel := na
+    trailStopLevel := na
+    trailActive := false
+    highestSinceEntry := na
+    lowestSinceEntry := na
+    currentSLLevel := na
+    currentTPLevel := na
+    currentEntryPrice := na
+    currentDirection := "NONE"
+    takeProfitPoints1 := stopLossPoints * riskRewardRatio1
+
+    if (isBullishMarketStructure and isBullishFVG and isVolatile and hasMomentumUp)
+        strategy.entry("Long", strategy.long, qty=position_size, comment="L")
+        partialCloseLevel := calculatePartialCloseLevel("LONG", close, close - stopLossPoints)
+        highestSinceEntry := high
+        currentEntryPrice := close
+        currentSLLevel := close - stopLossPoints
+        currentTPLevel := close + takeProfitPoints1
+        currentDirection := "LONG"
+
+    if (isBearishMarketStructure and isBearishFVG and isVolatile and hasMomentumDown)
+        strategy.entry("Short", strategy.short, qty=position_size, comment="S")
+        partialCloseLevel := calculatePartialCloseLevel("SHORT", close, close + stopLossPoints)
+        lowestSinceEntry := low
+        currentEntryPrice := close
+        currentSLLevel := close + stopLossPoints
+        currentTPLevel := close - takeProfitPoints1
+        currentDirection := "SHORT"
+
+// ==== Gestión posición larga ====
+if (strategy.position_size > 0)
+    entryPrice = strategy.opentrades.entry_price(0)
+    currentContracts = math.abs(strategy.position_size)
+    if useTrailingStop
+        if na(highestSinceEntry) or high > highestSinceEntry
+            highestSinceEntry := high
+        if not trailActive and high >= entryPrice + (stopLossPoints * riskRewardRatio1 * trailActivationPct)
+            trailActive := true
+            trailStopLevel := high - trailDistance
+        if trailActive and high > highestSinceEntry
+            highestSinceEntry := high
+            trailStopLevel := highestSinceEntry - trailDistance
+    if not partialCloseExecuted and low <= partialCloseLevel
+        contractsToClose = math.max(1, math.floor(currentContracts * partialCloseSize))
+        strategy.close("Long", qty=contractsToClose, comment="CIERRE PARCIAL 50%")
+        partialCloseExecuted := true
+        contractsClosed := contractsToClose
+    else if partialCloseExecuted and not reentryExecuted and checkReentryCondition("LONG", close, entryPrice)
+        strategy.entry("Long Reentry", strategy.long, qty=contractsClosed, comment="RE-ENTRADA")
+        reentryExecuted := true
+    if (not firstLegClosed and high > entryPrice + takeProfitPoints1)
+        strategy.close("Long", qty=qtyTP1, comment="TP1 (1 Contrato)")
+        firstLegClosed := true
+        stopLossBE := entryPrice + BEPlusPoints
+    float currentSL = entryPrice - stopLossPoints
+    if firstLegClosed
+        currentSL := stopLossBE
+    if useTrailingStop and trailActive and trailStopLevel > currentSL
+        currentSL := trailStopLevel
+    currentSLLevel := currentSL
+    currentTPLevel := entryPrice + takeProfitPoints1
+    currentEntryPrice := entryPrice
+    if (low < currentSL)
+        closeComment = trailActive ? "TRAILING STOP" : (firstLegClosed ? "BE+" : "SL")
+        strategy.close("Long", comment=closeComment, qty=strategy.position_size)
+        stopLossBE := na
+        trailStopLevel := na
+        trailActive := false
+        highestSinceEntry := na
+        currentSLLevel := na
+        currentTPLevel := na
+        currentEntryPrice := na
+        currentDirection := "NONE"
+    if (strategy.position_size > 0 and firstLegClosed and isBearishMarketStructure)
+        strategy.close("Long", comment="Reversión MSS", qty=strategy.position_size)
+        stopLossBE := na
+        trailStopLevel := na
+        trailActive := false
+        highestSinceEntry := na
+        currentSLLevel := na
+        currentTPLevel := na
+        currentEntryPrice := na
+        currentDirection := "NONE"
+
+// ==== Gestión posición corta ====
+if (strategy.position_size < 0)
+    entryPrice = strategy.opentrades.entry_price(0)
+    currentContracts = math.abs(strategy.position_size)
+    if useTrailingStop
+        if na(lowestSinceEntry) or low < lowestSinceEntry
+            lowestSinceEntry := low
+        if not trailActive and low <= entryPrice - (stopLossPoints * riskRewardRatio1 * trailActivationPct)
+            trailActive := true
+            trailStopLevel := low + trailDistance
+        if trailActive and low < lowestSinceEntry
+            lowestSinceEntry := low
+            trailStopLevel := lowestSinceEntry + trailDistance
+    if not partialCloseExecuted and high >= partialCloseLevel
+        contractsToClose = math.max(1, math.floor(currentContracts * partialCloseSize))
+        strategy.close("Short", qty=contractsToClose, comment="CIERRE PARCIAL 50%")
+        partialCloseExecuted := true
+        contractsClosed := contractsToClose
+    else if partialCloseExecuted and not reentryExecuted and checkReentryCondition("SHORT", close, entryPrice)
+        strategy.entry("Short Reentry", strategy.short, qty=contractsClosed, comment="RE-ENTRADA")
+        reentryExecuted := true
+    if (not firstLegClosed and low < entryPrice - takeProfitPoints1)
+        strategy.close("Short", qty=qtyTP1, comment="TP1 (1 Contrato)")
+        firstLegClosed := true
+        stopLossBE := entryPrice - BEPlusPoints
+    float currentSL = entryPrice + stopLossPoints
+    if firstLegClosed
+        currentSL := stopLossBE
+    if useTrailingStop and trailActive and trailStopLevel < currentSL
+        currentSL := trailStopLevel
+    currentSLLevel := currentSL
+    currentTPLevel := entryPrice - takeProfitPoints1
+    currentEntryPrice := entryPrice
+    if (high > currentSL)
+        closeComment = trailActive ? "TRAILING STOP" : (firstLegClosed ? "BE+" : "SL")
+        strategy.close("Short", comment=closeComment, qty=strategy.position_size)
+        stopLossBE := na
+        trailStopLevel := na
+        trailActive := false
+        lowestSinceEntry := na
+        currentSLLevel := na
+        currentTPLevel := na
+        currentEntryPrice := na
+        currentDirection := "NONE"
+    if (strategy.position_size < 0 and firstLegClosed and isBullishMarketStructure)
+        strategy.close("Short", comment="Reversión MSS", qty=strategy.position_size)
+        stopLossBE := na
+        trailStopLevel := na
+        trailActive := false
+        lowestSinceEntry := na
+        currentSLLevel := na
+        currentTPLevel := na
+        currentEntryPrice := na
+        currentDirection := "NONE"
+
+// ---- Cierre de posiciones fuera de horario ----
+if (not isTradingHours and strategy.position_size != 0)
+    strategy.close_all(comment="End of Day Close")
+    stopLossBE := na
+    partialCloseExecuted := false
+    contractsClosed := 0
+    reentryExecuted := false
+    trailStopLevel := na
+    trailActive := false
+    highestSinceEntry := na
+    lowestSinceEntry := na
+    currentSLLevel := na
+    currentTPLevel := na
+    currentEntryPrice := na
+    currentDirection := "NONE"
+
+// ==== Visualización con plot =====
+plot(showLevels ? currentSLLevel : na, color=slColor, linewidth=2, title="SL")
+plot(showLevels ? currentTPLevel : na, color=tpColor, linewidth=2, title="TP")
+plot(showLevels ? currentEntryPrice : na, color=entryColor, linewidth=1, style=plot.style_circles, title="Entry")
